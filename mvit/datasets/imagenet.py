@@ -1,150 +1,352 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved.
 
-import json
-import os
-import random
-import re
+"""Train/Evaluation workflow."""
 
+import pprint
+
+import mvit.models.losses as losses
+import mvit.models.optimizer as optim
+import mvit.utils.checkpoint as cu
+import mvit.utils.distributed as du
 import mvit.utils.logging as logging
+import mvit.utils.metrics as metrics
+import mvit.utils.misc as misc
+import numpy as np
 import torch
-import torch.utils.data
-from mvit.utils.env import pathmgr
-from PIL import Image
-from torchvision import transforms as transforms_tv
-
-from .build import DATASET_REGISTRY
-from .transform import transforms_imagenet_train
+from mvit.datasets import loader
+from mvit.datasets.mixup import MixUp
+from mvit.models import build_model
+from mvit.utils.meters import EpochTimer, TrainMeter, ValMeter
 
 logger = logging.get_logger(__name__)
 
 
-@DATASET_REGISTRY.register()
-class Imagenet(torch.utils.data.Dataset):
-    """ImageNet dataset."""
+def train_epoch(
+    train_loader,
+    model,
+    optimizer,
+    scaler,
+    train_meter,
+    cur_epoch,
+    cfg,
+):
+    """
+    Perform the training for one epoch.
+    Args:
+        train_loader (loader): training loader.
+        model (model): the model to train.
+        optimizer (optim): the optimizer to perform optimization on the model's
+            parameters.
+        scaler (GradScaler): the `GradScaler` to help perform the steps of gradient scaling.
+        train_meter (TrainMeter): training meters to log the training performance.
+        cur_epoch (int): current epoch of training.
+        cfg (CfgNode): configs. Details can be found in
+            mvit/config/defaults.py
+    """
+    # Enable train mode.
+    model.train()
+    train_meter.update_stats(
+            0,
+            0,
+            0,
+            
+            0.0001,
+             1)
+    train_meter.iter_tic()
+    data_size = len(train_loader)
 
-    def __init__(self, cfg, mode, num_retries=10):
-        self.num_retries = num_retries
-        self.cfg = cfg
-        self.mode = mode
-        self.data_path = cfg.DATA.PATH_TO_DATA_DIR
-        assert mode in [
-            "train",
-            "val",
-            "test",
-        ], "Split '{}' not supported for ImageNet".format(mode)
-        logger.info("Constructing ImageNet {}...".format(mode))
-        if cfg.DATA.PATH_TO_PRELOAD_IMDB == "":
-            self._construct_imdb()
-        else:
-            self._load_imdb()
-
-    def _load_imdb(self):
-        split_path = os.path.join(
-            self.cfg.DATA.PATH_TO_PRELOAD_IMDB,
-            f"{self.mode}.json" if self.mode != "test" else "val.json",
-        )
-        with pathmgr.open(split_path, "r") as f:
-            data = f.read()
-        self._imdb = json.loads(data)
-
-    def _construct_imdb(self):
-        """Constructs the imdb."""
-        # Compile the split data path
-        split_path = os.path.join(self.data_path, self.mode)
-        logger.info("{} data path: {}".format(self.mode, split_path))
-        # Images are stored per class in subdirs (format: n<number>)
-        split_files = pathmgr.ls(split_path)
-        self._class_ids = sorted(f for f in split_files)
-        # Map ImageNet class ids to contiguous ids
-        self._class_id_cont_id = {v: i for i, v in enumerate(self._class_ids)}
-        # Construct the image db
-        self._imdb = []
-        for class_id in self._class_ids:
-            cont_id = self._class_id_cont_id[class_id]
-            im_dir = os.path.join(split_path, class_id)
-            for im_name in pathmgr.ls(im_dir):
-                im_path = os.path.join(im_dir, im_name)
-                self._imdb.append({"im_path": im_path, "class": cont_id})
-        logger.info("Number of images: {}".format(len(self._imdb)))
-        logger.info("Number of classes: {}".format(len(self._class_ids)))
-
-    def _prepare_im(self, im_path):
-        with pathmgr.open(im_path, "rb") as f:
-            with Image.open(f) as im:
-                im = im.convert("RGB")
-        # Convert HWC/BGR/int to HWC/RGB/float format for applying transforms
-        train_size, test_size = (
-            self.cfg.DATA.TRAIN_CROP_SIZE,
-            self.cfg.DATA.TEST_CROP_SIZE,
+    if cfg.MIXUP.ENABLE:
+        mixup_fn = MixUp(
+            mixup_alpha=cfg.MIXUP.ALPHA,
+            cutmix_alpha=cfg.MIXUP.CUTMIX_ALPHA,
+            mix_prob=cfg.MIXUP.PROB,
+            switch_prob=cfg.MIXUP.SWITCH_PROB,
+            label_smoothing=cfg.MIXUP.LABEL_SMOOTH_VALUE,
+            num_classes=cfg.MODEL.NUM_CLASSES,
         )
 
-        if self.mode == "train":
-            aug_transform = transforms_imagenet_train(
-                img_size=(train_size, train_size),
-                color_jitter=self.cfg.AUG.COLOR_JITTER,
-                auto_augment=self.cfg.AUG.AA_TYPE,
-                interpolation=self.cfg.AUG.INTERPOLATION,
-                re_prob=self.cfg.AUG.RE_PROB,
-                re_mode=self.cfg.AUG.RE_MODE,
-                re_count=self.cfg.AUG.RE_COUNT,
-                mean=self.cfg.DATA.MEAN,
-                std=self.cfg.DATA.STD,
+    for cur_iter, (inputs, labels) in enumerate(train_loader):
+        # Transfer the data to the current GPU device.
+        if cfg.NUM_GPUS:
+            inputs = inputs.cuda(non_blocking=True)
+            labels = labels.cuda()
+
+        if cfg.MIXUP.ENABLE:
+            inputs, labels = mixup_fn(inputs, labels)
+
+        # Update the learning rate.
+        lr = optim.get_epoch_lr(cur_epoch + float(cur_iter) / data_size, cfg)
+        optim.set_lr(optimizer, lr)
+
+        train_meter.data_toc()
+
+        with torch.cuda.amp.autocast(enabled=cfg.TRAIN.MIXED_PRECISION):
+            preds = model(inputs)
+            # Explicitly declare reduction to mean.
+            loss_fun = losses.get_loss_func(cfg.MODEL.LOSS_FUNC)(reduction="mean")
+
+            # Compute the loss.
+            loss = loss_fun(preds, labels)
+
+        # check Nan Loss.
+        misc.check_nan_losses(loss)
+
+        # Perform the backward pass.
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        # Unscales the gradients of optimizer's assigned params in-place
+        scaler.unscale_(optimizer)
+        # Clip gradients if necessary
+        if cfg.SOLVER.CLIP_GRAD_VAL:
+            torch.nn.utils.clip_grad_value_(
+                model.parameters(), cfg.SOLVER.CLIP_GRAD_VAL
             )
-        else:
-            t = []
-            if self.cfg.DATA.VAL_CROP_RATIO == 0.0:
-                t.append(
-                    transforms_tv.Resize((test_size, test_size), interpolation=3),
-                )
-            else:
-                # size = int((256 / 224) * test_size) # = 1/0.875 * test_size
-                size = int((1.0 / self.cfg.DATA.VAL_CROP_RATIO) * test_size)
-                t.append(
-                    transforms_tv.Resize(
-                        size, interpolation=3
-                    ),  # to maintain same ratio w.r.t. 224 images
-                )
-                t.append(transforms_tv.CenterCrop(test_size))
-            t.append(transforms_tv.ToTensor())
-            t.append(transforms_tv.Normalize(self.cfg.DATA.MEAN, self.cfg.DATA.STD))
-            aug_transform = transforms_tv.Compose(t)
-        im = aug_transform(im)
-        return im
+        elif cfg.SOLVER.CLIP_GRAD_L2NORM:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), cfg.SOLVER.CLIP_GRAD_L2NORM
+            )
+        # Update the parameters.
+        scaler.step(optimizer)
+        scaler.update()
 
-    def __load__(self, index):
-        try:
-            # Load the image
-            im_path = self._imdb[index]["im_path"]
-            # Prepare the image for training / testing
-            if self.mode == "train" and self.cfg.AUG.NUM_SAMPLE > 1:
-                im = []
-                for _ in range(self.cfg.AUG.NUM_SAMPLE):
-                    crop = self._prepare_im(im_path)
-                    im.append(crop)
-                return im
-            else:
-                im = self._prepare_im(im_path)
-                return im
+        if cfg.MIXUP.ENABLE:
+            _top_max_k_vals, top_max_k_inds = torch.topk(
+                labels, 2, dim=1, largest=True, sorted=True
+            )
+            idx_top1 = torch.arange(labels.shape[0]), top_max_k_inds[:, 0]
+            idx_top2 = torch.arange(labels.shape[0]), top_max_k_inds[:, 1]
+            preds = preds.detach()
+            preds[idx_top1] += preds[idx_top2]
+            preds[idx_top2] = 0.0
+            labels = top_max_k_inds[:, 0]
 
-        except Exception as e:
-            print(e)
-            return None
+        num_topks_correct = metrics.topks_correct(preds, labels, (1, 5))
+        top1_err, top5_err = [
+            (1.0 - x / preds.size(0)) * 100.0 for x in num_topks_correct
+        ]
+        # Gather all the predictions across all the devices.
+        if cfg.NUM_GPUS > 1:
+            loss, top1_err, top5_err = du.all_reduce([loss, top1_err, top5_err])
 
-    def __getitem__(self, index):
-        # if the current image is corrupted, load a different image.
-        for _ in range(self.num_retries):
-            im = self.__load__(index)
-            # Data corrupted, retry with a different image.
-            if im is None:
-                index = random.randint(0, len(self._imdb) - 1)
-            else:
-                break
-        # Retrieve the label
-        label = self._imdb[index]["class"]
-        if isinstance(im, list):
-            label = [label for _ in range(len(im))]
+        # Copy the stats from GPU to CPU (sync point).
+        loss, top1_err, top5_err = (
+            loss.item(),
+            top1_err.item(),
+            top5_err.item(),
+        )
 
-        return im, label
+        # Update and log stats.
+        train_meter.update_stats(
+            top1_err,
+            top5_err,
+            loss,
+            lr,
+            inputs[0].size(0)
+            * max(
+                cfg.NUM_GPUS, 1
+            ),  # If running  on CPU (cfg.NUM_GPUS == 1), use 1 to represent 1 CPU.
+        )
 
-    def __len__(self):
-        return len(self._imdb)
+        train_meter.iter_toc()
+        train_meter.log_iter_stats(cur_epoch, cur_iter)
+        train_meter.iter_tic()
+
+    # Log epoch stats.
+    train_meter.log_epoch_stats(cur_epoch)
+    train_meter.reset()
+
+
+@torch.no_grad()
+def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg):
+    """
+    Evaluate the model on the val set.
+    Args:
+        val_loader (loader): data loader to provide validation data.
+        model (model): model to evaluate the performance.
+        val_meter (ValMeter): meter instance to record and calculate the metrics.
+        cur_epoch (int): number of the current epoch of training.
+        cfg (CfgNode): configs. Details can be found in
+            mvit/config/defaults.py
+    """
+
+    # Evaluation mode enabled. The running stats would not be updated.
+    model.eval()
+    val_meter.iter_tic()
+
+    for cur_iter, (inputs, labels) in enumerate(val_loader):
+        if cfg.NUM_GPUS:
+            # Transferthe data to the current GPU device.
+            inputs = inputs.cuda(non_blocking=True)
+            labels = labels.cuda()
+
+        val_meter.data_toc()
+
+        preds = model(inputs)
+
+        # select first 1000 IN1K classes for evaluation for IN21k
+        if cfg.DATA.IN22k_VAL_IN1K != "":
+            preds = preds[:, :1000]
+
+        # Compute the errors.
+        num_topks_correct = metrics.topks_correct(preds, labels, (1, 5))
+
+        # Combine the errors across the GPUs.
+        top1_err, top5_err = [
+            (1.0 - x / preds.size(0)) * 100.0 for x in num_topks_correct
+        ]
+        if cfg.NUM_GPUS > 1:
+            top1_err, top5_err = du.all_reduce([top1_err, top5_err])
+
+        # Copy the errors from GPU to CPU (sync point).
+        top1_err, top5_err = top1_err.item(), top5_err.item()
+
+        val_meter.iter_toc()
+        # Update and log stats.
+        val_meter.update_stats(
+            top1_err,
+            top5_err,
+            inputs[0].size(0)
+            * max(
+                cfg.NUM_GPUS, 1
+            ),  # If running  on CPU (cfg.NUM_GPUS == 1), use 1 to represent 1 CPU.
+        )
+        val_meter.update_predictions(preds, labels)
+        val_meter.log_iter_stats(cur_epoch, cur_iter)
+        val_meter.iter_tic()
+
+    # Log epoch stats.
+    val_meter.log_epoch_stats(cur_epoch)
+    val_meter.reset()
+
+
+def train(cfg):
+    """
+    Train a model on train set and evaluate it on val set.
+    Args:
+        cfg (CfgNode): configs. Details can be found in mvit/config/defaults.py
+    """
+    # Set up environment.
+    du.init_distributed_training(cfg)
+    # Set random seed from configs.
+    np.random.seed(cfg.RNG_SEED)
+    torch.manual_seed(cfg.RNG_SEED)
+
+    # Setup logging format.
+    logging.setup_logging(cfg.OUTPUT_DIR)
+
+    # Print config.
+    logger.info("Train with config:")
+    logger.info(pprint.pformat(cfg))
+
+    # Build the model and print model statistics.
+    model = build_model(cfg)
+    if du.is_master_proc() and cfg.LOG_MODEL_INFO:
+        misc.log_model_info(model, cfg, use_train_input=True)
+
+    # Construct the optimizer.
+    optimizer = optim.construct_optimizer(model, cfg)
+    # Create a GradScaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.TRAIN.MIXED_PRECISION)
+
+    # Load a checkpoint to resume training if applicable.
+    start_epoch = cu.load_train_checkpoint(
+        cfg, model, optimizer, scaler if cfg.TRAIN.MIXED_PRECISION else None
+    )
+
+    # Create the train and val loaders.
+    train_loader = loader.construct_loader(cfg, "train")
+    val_loader = loader.construct_loader(cfg, "val")
+
+    # Create meters.
+    train_meter = TrainMeter(len(train_loader), cfg)
+    val_meter = ValMeter(len(val_loader), cfg)
+
+    # Perform the training loop.
+    logger.info("Start epoch: {}".format(start_epoch + 1))
+
+    epoch_timer = EpochTimer()
+    for cur_epoch in range(start_epoch, cfg.SOLVER.MAX_EPOCH):
+        # Shuffle the dataset.
+        loader.shuffle_dataset(train_loader, cur_epoch)
+
+        # Train for one epoch.
+        epoch_timer.epoch_tic()
+        train_epoch(
+            train_loader,
+            model,
+            optimizer,
+            scaler,
+            train_meter,
+            cur_epoch,
+            cfg,
+        )
+        epoch_timer.epoch_toc()
+        logger.info(
+            f"Epoch {cur_epoch} takes {epoch_timer.last_epoch_time():.2f}s. Epochs "
+            f"from {start_epoch} to {cur_epoch} take "
+            f"{epoch_timer.avg_epoch_time():.2f}s in average and "
+            f"{epoch_timer.median_epoch_time():.2f}s in median."
+        )
+        import ipdb; ipdb.set_trace()
+        logger.info(
+            f"For epoch {cur_epoch}, each iteraction takes "
+            f"{epoch_timer.last_epoch_time()/len(train_loader):.2f}s in average. "
+            f"From epoch {start_epoch} to {cur_epoch}, each iteraction takes "
+            f"{epoch_timer.avg_epoch_time()/len(train_loader):.2f}s in average."
+        )
+
+        is_checkp_epoch = cu.is_checkpoint_epoch(
+            cfg,
+            cur_epoch,
+        )
+        is_eval_epoch = misc.is_eval_epoch(cfg, cur_epoch)
+
+        # Save a checkpoint.
+        if is_checkp_epoch:
+            cu.save_checkpoint(
+                cfg.OUTPUT_DIR,
+                model,
+                optimizer,
+                cur_epoch,
+                cfg,
+                scaler if cfg.TRAIN.MIXED_PRECISION else None,
+            )
+        # Evaluate the model on validation set.
+        if is_eval_epoch:
+            eval_epoch(val_loader, model, val_meter, cur_epoch, cfg)
+
+
+def test(cfg):
+    """
+    Perform testing on the pretrained model.
+    Args:
+        cfg (CfgNode): configs. Details can be found in mvit/config/defaults.py
+    """
+    # Set up environment.
+    du.init_distributed_training(cfg)
+    # Set random seed from configs.
+    np.random.seed(cfg.RNG_SEED)
+    torch.manual_seed(cfg.RNG_SEED)
+
+    # Setup logging format.
+    logging.setup_logging(cfg.OUTPUT_DIR)
+
+    # Print config.
+    logger.info("Test with config:")
+    logger.info(pprint.pformat(cfg))
+
+    # Build the model and print model statistics.
+    model = build_model(cfg)
+    if du.is_master_proc() and cfg.LOG_MODEL_INFO:
+        misc.log_model_info(model, cfg, use_train_input=False)
+
+    cu.load_test_checkpoint(cfg, model)
+
+    # Create testing loaders.
+    test_loader = loader.construct_loader(cfg, "test")
+    logger.info("Testing model for {} iterations".format(len(test_loader)))
+
+    # Create meters.
+    test_meter = ValMeter(len(test_loader), cfg)
+
+    eval_epoch(test_loader, model, test_meter, -1, cfg)
