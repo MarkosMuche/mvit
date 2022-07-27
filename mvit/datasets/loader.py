@@ -74,7 +74,7 @@ def construct_loader(cfg, split):
         sampler=sampler,
         num_workers=cfg.DATA_LOADER.NUM_WORKERS,
         pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
-        drop_last=drop_last,
+        # drop_last=drop_last,
         collate_fn=collate_func,
     )
     return loader
