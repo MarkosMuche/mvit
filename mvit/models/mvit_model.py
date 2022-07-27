@@ -148,7 +148,10 @@ class MViT(nn.Module):
             spatial_size // cfg.MVIT.PATCH_STRIDE[0],
             spatial_size // cfg.MVIT.PATCH_STRIDE[1],
         ]
-        num_patches = math.prod(patch_dims)
+        from functools import reduce
+        import operator
+
+        num_patches = reduce(operator.mul, patch_dims, 1)
 
         dpr = [
             x.item() for x in torch.linspace(0, cfg.MVIT.DROPPATH_RATE, depth)
