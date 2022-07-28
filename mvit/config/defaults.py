@@ -122,7 +122,7 @@ _C.MODEL = CfgNode()
 _C.MODEL.MODEL_NAME = "MViT"
 
 # The number of classes to predict for the model.
-_C.MODEL.NUM_CLASSES = 1000
+_C.MODEL.NUM_CLASSES = 2
 
 # Loss function.
 _C.MODEL.LOSS_FUNC = "soft_cross_entropy"
