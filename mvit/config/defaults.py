@@ -20,7 +20,7 @@ _C.TRAIN.ENABLE = True
 _C.TRAIN.DATASET = "imagenet"
 
 # Total mini-batch size.
-_C.TRAIN.BATCH_SIZE = 256
+_C.TRAIN.BATCH_SIZE = 2
 
 # Evaluate model on test data every eval period epochs.
 _C.TRAIN.EVAL_PERIOD = 10
@@ -227,7 +227,7 @@ _C.MVIT.DIM_MUL_IN_ATT = True
 _C.DATA = CfgNode()
 
 # The path to the data directory.
-_C.DATA.PATH_TO_DATA_DIR = ""
+_C.DATA.PATH_TO_DATA_DIR = "data/imagenet"
 
 # If a imdb have been dumpped to a local file with the following format:
 # `{"im_path": im_path, "class": cont_id}`
@@ -329,7 +329,7 @@ _C.SOLVER.LAYER_DECAY = 1.0
 # ---------------------------------------------------------------------------- #
 
 # Number of GPUs to use (applies to both training and testing).
-_C.NUM_GPUS = 8
+_C.NUM_GPUS = 0
 
 # Number of machine to use for the job.
 _C.NUM_SHARDS = 1
