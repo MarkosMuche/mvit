@@ -4,7 +4,7 @@
 
 import argparse
 import sys
-
+sys.path.append('../')
 import mvit.utils.checkpoint as cu
 from engine import test, train
 from mvit.config.defaults import assert_and_infer_cfg, get_cfg
@@ -51,7 +51,7 @@ def parse_args():
         "--cfg",
         dest="cfg_file",
         help="Path to the config file",
-        default="configs/MVIT_B.yaml",
+        default="configs/MVITv2_B.yaml",
         type=str,
     )
     parser.add_argument(
